@@ -1,0 +1,169 @@
+"""
+models.py
+
+SQLAlchemy ORM Models — Lavender Trinetra Platform
+=====================================================================
+
+Defines the relational schema backing the monitoring platform:
+
+    - TestRun         one row per monitoring session
+    - SystemMetric     one row per collected system metrics sample
+                        (mirrors backend/data/system_metrics.csv)
+    - SystemProcess    one row per collected top-process sample
+                        (mirrors backend/data/system_processes.csv)
+
+SystemMetric and SystemProcess each optionally belong to a TestRun via
+a foreign key, allowing a session's full metric/process history to be
+queried through TestRun.metrics / TestRun.processes.
+
+Integrates with:
+    - database/database.py  (declares against the shared Base; tables
+                              created via init_db())
+    - database/crud.py      (performs queries/inserts against these models)
+    - api/api.py             (schemas.py maps these to Pydantic response models)
+
+Author: Lavender Trinetra Backend Engineering
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import (
+    Column,
+    Integer,
+    Float,
+    String,
+    DateTime,
+    ForeignKey,
+    Index,
+)
+from sqlalchemy.orm import relationship
+
+try:
+    from .database import Base
+except ImportError:  # pragma: no cover - fallback for non-package execution
+    from database import Base  # type: ignore
+
+
+# =====================================================================
+# TEST RUN
+# =====================================================================
+
+class TestRun(Base):
+    """Represents a single monitoring session, from start to stop."""
+
+    __tablename__ = "test_run"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    start_time = Column(DateTime, nullable=False, default=datetime.utcnow)
+    end_time = Column(DateTime, nullable=True)
+    duration = Column(Float, nullable=True, comment="Session duration in seconds")
+    total_alerts = Column(Integer, nullable=False, default=0)
+
+    metrics = relationship(
+        "SystemMetric",
+        back_populates="test_run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    processes = relationship(
+        "SystemProcess",
+        back_populates="test_run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug convenience
+        return (
+            f"<TestRun id={self.id} start_time={self.start_time} "
+            f"end_time={self.end_time} total_alerts={self.total_alerts}>"
+        )
+
+
+# =====================================================================
+# SYSTEM METRICS
+# =====================================================================
+
+class SystemMetric(Base):
+    """
+    One system-level metrics sample, mirroring the columns written to
+    backend/data/system_metrics.csv by monitoring/metrics.py.
+    """
+
+    __tablename__ = "system_metrics"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    test_run_id = Column(
+        Integer,
+        ForeignKey("test_run.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+
+    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    cpu_usage = Column(Float, nullable=False, default=0.0)
+    ram_usage = Column(Float, nullable=False, default=0.0)
+    disk_usage = Column(Float, nullable=False, default=0.0)
+    disk_read_bps = Column(Float, nullable=False, default=0.0)
+    disk_write_bps = Column(Float, nullable=False, default=0.0)
+    network_in_bps = Column(Float, nullable=False, default=0.0)
+    network_out_bps = Column(Float, nullable=False, default=0.0)
+
+    test_run = relationship("TestRun", back_populates="metrics")
+
+    __table_args__ = (
+        Index("ix_system_metrics_test_run_timestamp", "test_run_id", "timestamp"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug convenience
+        return (
+            f"<SystemMetric id={self.id} timestamp={self.timestamp} "
+            f"cpu={self.cpu_usage} ram={self.ram_usage} disk={self.disk_usage}>"
+        )
+
+
+# =====================================================================
+# SYSTEM PROCESSES
+# =====================================================================
+
+class SystemProcess(Base):
+    """
+    One process resource-usage sample, mirroring the columns written to
+    backend/data/system_processes.csv by monitoring/metrics.py.
+    """
+
+    __tablename__ = "system_processes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    test_run_id = Column(
+        Integer,
+        ForeignKey("test_run.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+
+    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    pid = Column(Integer, nullable=True)
+    name = Column(String(255), nullable=False, default="unknown", index=True)
+    cpu_percent = Column(Float, nullable=False, default=0.0)
+    memory_percent = Column(Float, nullable=False, default=0.0)
+
+    test_run = relationship("TestRun", back_populates="processes")
+
+    __table_args__ = (
+        Index("ix_system_processes_test_run_timestamp", "test_run_id", "timestamp"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug convenience
+        return (
+            f"<SystemProcess id={self.id} name={self.name} "
+            f"cpu={self.cpu_percent} mem={self.memory_percent}>"
+        )
+
+
+__all__ = [
+    "TestRun",
+    "SystemMetric",
+    "SystemProcess",
+]
