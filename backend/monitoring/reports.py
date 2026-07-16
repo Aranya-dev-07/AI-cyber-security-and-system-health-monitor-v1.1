@@ -1,398 +1,250 @@
 """
-backend/monitoring/reports.py
-==============================
-Post-session report generation for the Lavender Trinetra platform.
+reports.py
 
-Responsible ONLY for summarizing a completed monitoring session into a
-single structured report and appending it to ``system_report.csv``.
-Triggered by ``main.py`` once a monitoring run has been stopped — this
-module never starts/stops monitoring itself and refuses to run while a
-session is still active (see :func:`generate_report`).
+Session Report Generator — Lavender Trinetra Platform
+=====================================================================
 
-Dependencies (one-directional):
-    reports.py --> config.py    (REPORT_STORAGE_PATH)
-    reports.py --> collector.py (session start/stop times, active flag)
-    reports.py --> alerts.py    (alert counts/severity breakdown)
-    reports.py --> metrics.py   (raw metrics/process history for the session)
+When monitoring stops, reads the current session's data from the
+system_metrics.csv and system_processes.csv files (written throughout
+the session by metrics.py), computes a summary (averages, peaks, alert
+totals, top processes), appends it to system_report.csv via
+metrics.py, and returns the summary as a structured dictionary.
 
-ASSUMED metrics.py INTERFACE
-------------------------------
-This module expects ``metrics.py`` to expose:
-    * ``get_session_metrics() -> List[Dict[str, Any]]``
-        Every system-metrics snapshot collected this session (each with
-        ``cpu_percent``, ``ram_percent``, ``disk_percent``,
-        ``net_sent_mb``, ``net_recv_mb``).
-    * ``get_session_processes() -> List[List[Dict[str, Any]]]``
-        Every per-cycle top-processes list collected this session.
-If ``metrics.py`` ends up shaped differently, only the two read calls in
-:func:`_load_session_data` need to change — everything downstream works
-off plain dicts/lists.
+Integrates with:
+    - metrics.py    (sole CSV reader/writer — reports.py never touches disk directly)
+    - alerts.py     (supplies session alert statistics)
+    - main.py       (invokes generate_session_report() on "stop")
+    - api/routes.py / dashboard.py (consume the returned summary dict)
 
-AI INTEGRATION HOOK
---------------------
-``register_report_hook()`` lets another module (most likely a future
-``ai_engine`` report generator) subscribe to receive the structured report
-dict right after it's built — e.g. to produce a narrative summary, feed a
-trend model, or flag the run as anomalous. A hook that raises is caught
-and logged; it never breaks report generation.
+Author: Lavender Trinetra Backend Engineering
 """
 
 from __future__ import annotations
 
-import csv
-import json
-import os
-import threading
-from dataclasses import dataclass, asdict
+import logging
+from collections import defaultdict
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional
-
-from loguru import logger
+from typing import Any, Optional
 
 try:
-    from backend.config import REPORT_STORAGE_PATH
-except ImportError:
-    REPORT_STORAGE_PATH = "."
+    from . import metrics
+    from . import alerts
+except ImportError:  # pragma: no cover - fallback for non-package execution
+    import metrics  # type: ignore
+    import alerts  # type: ignore
 
-try:
-    from backend.config import TOP_PROCESS_COUNT
-except ImportError:
-    TOP_PROCESS_COUNT = 5
-
-from backend.monitoring import collector as collector_module
-from backend.monitoring import alerts as alert_engine
-from backend.monitoring import metrics as metrics_store
+logger = logging.getLogger("lavender_trinetra.monitoring.reports")
+logger.addHandler(logging.NullHandler())
 
 
-REPORT_CSV_FILENAME = "system_report.csv"
-REPORT_CSV_PATH = os.path.join(REPORT_STORAGE_PATH, REPORT_CSV_FILENAME)
+# =====================================================================
+# HELPERS
+# =====================================================================
 
-REPORT_CSV_FIELDS: List[str] = [
-    "generated_at",
-    "start_time",
-    "end_time",
-    "duration_seconds",
-    "avg_cpu",
-    "peak_cpu",
-    "avg_ram",
-    "peak_ram",
-    "avg_disk",
-    "avg_network_mb",
-    "total_alerts",
-    "warning_alerts",
-    "critical_alerts",
-    "top_processes",  # JSON-encoded list, since CSV rows are flat
-]
+def _to_float(value: Any, default: float = 0.0) -> float:
+    """Safely coerce a CSV string value to float, tolerating blanks/None."""
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
-# ---------------------------------------------------------------------------
-# Data model
-# ---------------------------------------------------------------------------
-@dataclass
-class SessionReport:
-    """Structured summary of one completed monitoring session.
-
-    Attributes:
-        generated_at: ISO-8601 timestamp the report itself was built.
-        start_time: ISO-8601 timestamp the monitoring session started.
-        end_time: ISO-8601 timestamp the monitoring session stopped.
-        duration_seconds: Total session duration, in seconds.
-        avg_cpu: Average CPU utilisation across the session, in percent.
-        peak_cpu: Peak CPU utilisation observed, in percent.
-        avg_ram: Average RAM utilisation across the session, in percent.
-        peak_ram: Peak RAM utilisation observed, in percent.
-        avg_disk: Average disk utilisation across the session, in percent.
-        avg_network_mb: Average network throughput per cycle (sent +
-            received), in MB.
-        total_alerts: Total number of alerts raised during the session.
-        warning_alerts: Count of WARNING-severity alerts.
-        critical_alerts: Count of CRITICAL-severity alerts.
-        top_processes: Top resource-consuming processes across the
-            session, ranked by peak CPU usage.
-    """
-
-    generated_at: str
-    start_time: Optional[str]
-    end_time: Optional[str]
-    duration_seconds: float
-    avg_cpu: float
-    peak_cpu: float
-    avg_ram: float
-    peak_ram: float
-    avg_disk: float
-    avg_network_mb: float
-    total_alerts: int
-    warning_alerts: int
-    critical_alerts: int
-    top_processes: List[Dict[str, Any]]
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+def _to_int(value: Any, default: int = 0) -> int:
+    """Safely coerce a value to int, tolerating blanks/None."""
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
 
 
-_state_lock = threading.Lock()
-_last_report: Optional[Dict[str, Any]] = None
-_report_hooks: List[Callable[[Dict[str, Any]], None]] = []
+def _parse_timestamp(value: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO 8601 timestamp string, returning None on failure."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
-def register_report_hook(hook: Callable[[Dict[str, Any]], None]) -> None:
-    """Register a callback invoked with the report dict after generation.
+# =====================================================================
+# AGGREGATION
+# =====================================================================
 
-    Intended for future AI-engine integration (narrative report
-    generation, trend modeling, anomaly flagging). A hook that raises is
-    caught and logged — it never breaks report generation for other hooks
-    or the caller.
+def _aggregate_metrics_rows(rows: list[dict[str, str]]) -> dict[str, Any]:
+    """Compute averages/peaks for CPU, RAM, Disk, and Network from
+    system_metrics.csv rows belonging to the current session."""
+    if not rows:
+        return {
+            "avg_cpu": 0.0, "peak_cpu": 0.0,
+            "avg_ram": 0.0, "peak_ram": 0.0,
+            "avg_disk_usage": 0.0,
+            "avg_network_usage_bps": 0.0,
+        }
 
-    Args:
-        hook: A callable accepting a single report dict (see
-            :meth:`SessionReport.to_dict`).
-    """
-    with _state_lock:
-        _report_hooks.append(hook)
-    logger.info("Registered report hook: {}", getattr(hook, "__name__", repr(hook)))
+    cpu_values = [_to_float(r.get("cpu_usage")) for r in rows]
+    ram_values = [_to_float(r.get("ram_usage")) for r in rows]
+    disk_values = [_to_float(r.get("disk_usage")) for r in rows]
+    network_values = [
+        _to_float(r.get("network_in_bps")) + _to_float(r.get("network_out_bps"))
+        for r in rows
+    ]
 
-
-def get_last_report() -> Optional[Dict[str, Any]]:
-    """Return the most recently generated report, or ``None`` if none yet."""
-    with _state_lock:
-        return _last_report
-
-
-# ---------------------------------------------------------------------------
-# Data loading / aggregation helpers
-# ---------------------------------------------------------------------------
-def _load_session_data() -> Dict[str, Any]:
-    """Pull everything needed to build a report from the other modules.
-
-    Isolated into its own function so a failure reading any one source
-    (metrics history, alert history, session bookkeeping) is caught and
-    logged individually rather than aborting the whole report.
-
-    Returns:
-        A dict with keys: ``session``, ``metrics``, ``processes``,
-        ``alerts``. Missing/failed sources default to empty
-        lists/dicts so downstream aggregation degrades gracefully.
-    """
-    data: Dict[str, Any] = {
-        "session": {},
-        "metrics": [],
-        "processes": [],
-        "alerts": [],
+    return {
+        "avg_cpu": round(sum(cpu_values) / len(cpu_values), 2),
+        "peak_cpu": round(max(cpu_values), 2),
+        "avg_ram": round(sum(ram_values) / len(ram_values), 2),
+        "peak_ram": round(max(ram_values), 2),
+        "avg_disk_usage": round(sum(disk_values) / len(disk_values), 2),
+        "avg_network_usage_bps": round(sum(network_values) / len(network_values), 2),
     }
 
-    try:
-        data["session"] = collector_module.get_session_snapshot()
-    except Exception:
-        logger.exception("Failed to read session bookkeeping from collector.py.")
 
-    try:
-        data["metrics"] = metrics_store.get_session_metrics()
-    except Exception:
-        logger.exception("Failed to read session metrics history from metrics.py.")
-
-    try:
-        data["processes"] = metrics_store.get_session_processes()
-    except Exception:
-        logger.exception("Failed to read session process history from metrics.py.")
-
-    try:
-        # Request the full session's worth of alerts; get_recent_alerts()
-        # is bounded by alerts.py's internal history cap (500), so very
-        # long/noisy sessions may lose granular severity breakdown beyond
-        # that cap even though get_alert_count() stays accurate.
-        data["alerts"] = alert_engine.get_recent_alerts(limit=10_000)
-    except Exception:
-        logger.exception("Failed to read alert history from alerts.py.")
-
-    return data
-
-
-def _safe_avg(values: List[float]) -> float:
-    clean = [v for v in values if isinstance(v, (int, float))]
-    return round(sum(clean) / len(clean), 2) if clean else 0.0
-
-
-def _safe_peak(values: List[float]) -> float:
-    clean = [v for v in values if isinstance(v, (int, float))]
-    return round(max(clean), 2) if clean else 0.0
-
-
-def _aggregate_top_processes(
-    process_cycles: List[List[Dict[str, Any]]], limit: int = TOP_PROCESS_COUNT
-) -> List[Dict[str, Any]]:
-    """Collapse every cycle's top-processes list into one session-wide ranking.
-
-    Groups all observed process snapshots by PID, keeps each process's
-    peak CPU/memory usage across the session, and returns the top
-    ``limit`` processes ranked by peak CPU.
-
-    Args:
-        process_cycles: A list of per-cycle process snapshot lists, as
-            produced by ``processes.get_top_processes()`` each cycle.
-        limit: Maximum number of processes to include in the result.
-
-    Returns:
-        A list of dicts: ``pid``, ``name``, ``peak_cpu_percent``,
-        ``peak_memory_percent``. Empty list if no process data available.
+def _top_resource_processes(rows: list[dict[str, str]], top_n: int = 5) -> list[dict[str, Any]]:
     """
-    try:
-        by_pid: Dict[int, Dict[str, Any]] = {}
-
-        for cycle in process_cycles or []:
-            for proc in cycle or []:
-                pid = proc.get("pid")
-                if pid is None:
-                    continue
-                cpu = float(proc.get("cpu_percent") or 0.0)
-                mem = float(proc.get("memory_percent") or 0.0)
-
-                existing = by_pid.get(pid)
-                if existing is None:
-                    by_pid[pid] = {
-                        "pid": pid,
-                        "name": proc.get("name", "unknown"),
-                        "peak_cpu_percent": cpu,
-                        "peak_memory_percent": mem,
-                    }
-                else:
-                    existing["peak_cpu_percent"] = max(existing["peak_cpu_percent"], cpu)
-                    existing["peak_memory_percent"] = max(existing["peak_memory_percent"], mem)
-
-        ranked = sorted(by_pid.values(), key=lambda p: p["peak_cpu_percent"], reverse=True)
-        return ranked[:limit]
-
-    except Exception:
-        logger.exception("Failed to aggregate top processes for report.")
+    Identify the top resource-consuming processes across the session
+    from system_processes.csv rows, ranked by average combined
+    CPU + memory usage.
+    """
+    if not rows:
         return []
 
+    totals: dict[str, dict[str, float]] = defaultdict(lambda: {"cpu_sum": 0.0, "mem_sum": 0.0, "count": 0.0})
 
-def _compute_duration_seconds(start_time: Optional[str], end_time: Optional[str]) -> float:
-    """Compute session duration in seconds from ISO-8601 timestamp strings."""
-    if not start_time or not end_time:
-        return 0.0
-    try:
-        start_dt = datetime.fromisoformat(start_time)
-        end_dt = datetime.fromisoformat(end_time)
-        return round((end_dt - start_dt).total_seconds(), 2)
-    except Exception:
-        logger.warning("Failed to compute session duration from timestamps.", exc_info=True)
-        return 0.0
+    for row in rows:
+        name = row.get("name") or "unknown"
+        totals[name]["cpu_sum"] += _to_float(row.get("cpu_percent"))
+        totals[name]["mem_sum"] += _to_float(row.get("memory_percent"))
+        totals[name]["count"] += 1
+
+    ranked = []
+    for name, agg in totals.items():
+        count = agg["count"] or 1.0
+        avg_cpu = agg["cpu_sum"] / count
+        avg_mem = agg["mem_sum"] / count
+        ranked.append({
+            "name": name,
+            "avg_cpu_percent": round(avg_cpu, 2),
+            "avg_memory_percent": round(avg_mem, 2),
+            "combined_score": round(avg_cpu + avg_mem, 2),
+        })
+
+    ranked.sort(key=lambda p: p["combined_score"], reverse=True)
+    return ranked[:top_n]
 
 
-# ---------------------------------------------------------------------------
-# CSV persistence
-# ---------------------------------------------------------------------------
-def _save_report_to_csv(report: Dict[str, Any]) -> None:
-    """Append one report row to ``system_report.csv``, writing a header if new.
+# =====================================================================
+# CORE REPORT GENERATION
+# =====================================================================
 
-    Never raises: IO errors are caught and logged so a failed write does
-    not prevent the report dict from being returned to the caller.
+def generate_session_report(
+    session_start: datetime,
+    session_end: Optional[datetime] = None,
+    alert_tracker: Optional["alerts.AlertSessionTracker"] = None,
+) -> dict[str, Any]:
     """
-    try:
-        os.makedirs(os.path.dirname(REPORT_CSV_PATH) or ".", exist_ok=True)
-        file_exists = os.path.isfile(REPORT_CSV_PATH)
+    Generate a full monitoring session summary and append it to
+    system_report.csv.
 
-        row = dict(report)
-        row["top_processes"] = json.dumps(row.get("top_processes", []))
-
-        with open(REPORT_CSV_PATH, mode="a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=REPORT_CSV_FIELDS)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerow({k: row.get(k, "") for k in REPORT_CSV_FIELDS})
-
-        logger.info("Report saved to {}.", REPORT_CSV_PATH)
-
-    except Exception:
-        logger.exception("Failed to save report to {}.", REPORT_CSV_PATH)
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-def generate_report() -> Dict[str, Any]:
-    """Generate and persist a summary report for the just-completed session.
-
-    Refuses to run while monitoring is still active — call this only
-    after ``collector.stop_monitoring()`` has completed. This is enforced
-    defensively (logged + empty dict returned) rather than raising, to
-    keep this module's error-handling style consistent with the rest of
-    the monitoring package.
+    Args:
+        session_start: Timestamp marking when monitoring began.
+        session_end: Timestamp marking when monitoring stopped;
+            defaults to the current UTC time.
+        alert_tracker: AlertSessionTracker to pull statistics from;
+            defaults to alerts.py's module-wide singleton.
 
     Returns:
-        The generated report as a structured dict (see
-        :meth:`SessionReport.to_dict`), or an empty dict if generation
-        was refused or failed entirely.
+        Structured dict summary, matching metrics.SYSTEM_REPORT_HEADERS
+        plus a nested "top_processes" breakdown and raw alert counts.
     """
-    global _last_report
-
     try:
-        if collector_module.is_monitoring_active():
-            logger.error(
-                "generate_report() called while monitoring is still active. "
-                "Call collector.stop_monitoring() first."
-            )
-            return {}
-    except Exception:
-        logger.exception("Failed to check monitoring status before generating report.")
-        return {}
+        end_time = session_end or datetime.utcnow()
+        duration_seconds = max(0.0, (end_time - session_start).total_seconds())
 
-    try:
-        data = _load_session_data()
-        session = data["session"]
-        metrics_history = data["metrics"]
-        process_history = data["processes"]
-        alert_history = data["alerts"]
-
-        cpu_values = [m.get("cpu_percent") for m in metrics_history]
-        ram_values = [m.get("ram_percent") for m in metrics_history]
-        disk_values = [m.get("disk_percent") for m in metrics_history]
-        network_values = [
-            (m.get("net_sent_mb") or 0) + (m.get("net_recv_mb") or 0) for m in metrics_history
-        ]
-
-        warning_count = sum(1 for a in alert_history if a.get("severity") == alert_engine.SEVERITY_WARNING)
-        critical_count = sum(1 for a in alert_history if a.get("severity") == alert_engine.SEVERITY_CRITICAL)
-
-        start_time = session.get("started_at")
-        end_time = session.get("stopped_at")
-
-        report = SessionReport(
-            generated_at=datetime.now().isoformat(),
-            start_time=start_time,
-            end_time=end_time,
-            duration_seconds=_compute_duration_seconds(start_time, end_time),
-            avg_cpu=_safe_avg(cpu_values),
-            peak_cpu=_safe_peak(cpu_values),
-            avg_ram=_safe_avg(ram_values),
-            peak_ram=_safe_peak(ram_values),
-            avg_disk=_safe_avg(disk_values),
-            avg_network_mb=_safe_avg(network_values),
-            total_alerts=alert_engine.get_alert_count(),
-            warning_alerts=warning_count,
-            critical_alerts=critical_count,
-            top_processes=_aggregate_top_processes(process_history),
+        metrics_rows = metrics.read_metrics_since(
+            metrics.SYSTEM_METRICS_CSV, session_start, metrics.SYSTEM_METRICS_HEADERS
         )
-        report_dict = report.to_dict()
+        process_rows = metrics.read_metrics_since(
+            metrics.SYSTEM_PROCESSES_CSV, session_start, metrics.SYSTEM_PROCESSES_HEADERS
+        )
 
-        _save_report_to_csv(report_dict)
+        metric_aggregates = _aggregate_metrics_rows(metrics_rows)
+        top_processes = _top_resource_processes(process_rows)
 
-        with _state_lock:
-            _last_report = report_dict
+        alert_stats = alerts.get_alert_statistics(alert_tracker)
 
-        for hook in list(_report_hooks):
-            try:
-                hook(report_dict)
-            except Exception:
-                logger.exception("Report hook {} raised an exception.", getattr(hook, "__name__", hook))
+        top_processes_str = "; ".join(
+            f"{p['name']} (cpu={p['avg_cpu_percent']}%, mem={p['avg_memory_percent']}%)"
+            for p in top_processes
+        )
+
+        report_row = {
+            "start_time": session_start.isoformat(),
+            "end_time": end_time.isoformat(),
+            "duration_seconds": round(duration_seconds, 2),
+            "avg_cpu": metric_aggregates["avg_cpu"],
+            "peak_cpu": metric_aggregates["peak_cpu"],
+            "avg_ram": metric_aggregates["avg_ram"],
+            "peak_ram": metric_aggregates["peak_ram"],
+            "avg_disk_usage": metric_aggregates["avg_disk_usage"],
+            "avg_network_usage_bps": metric_aggregates["avg_network_usage_bps"],
+            "total_alerts": alert_stats["total_alerts"],
+            "warning_alerts": alert_stats["warning_alerts"],
+            "critical_alerts": alert_stats["critical_alerts"],
+            "top_processes": top_processes_str,
+        }
+
+        metrics.save_system_report(report_row)
+
+        summary: dict[str, Any] = dict(report_row)
+        summary["top_processes"] = top_processes  # structured form for API/dashboard consumers
+        summary["sample_count"] = len(metrics_rows)
 
         logger.info(
-            "Report generated: duration={}s avg_cpu={}% avg_ram={}% total_alerts={}",
-            report_dict["duration_seconds"], report_dict["avg_cpu"],
-            report_dict["avg_ram"], report_dict["total_alerts"],
+            "Session report generated: duration=%.1fs avg_cpu=%.1f%% total_alerts=%d",
+            duration_seconds, metric_aggregates["avg_cpu"], alert_stats["total_alerts"],
         )
-        return report_dict
 
-    except Exception:
-        logger.exception("Failed to generate session report.")
-        return {}
+        return summary
+
+    except Exception as exc:
+        logger.exception("Session report generation failed: %s", exc)
+        return {
+            "start_time": session_start.isoformat(),
+            "end_time": (session_end or datetime.utcnow()).isoformat(),
+            "error": str(exc),
+        }
+
+
+def generate_report_on_stop(
+    session_start: datetime,
+    alert_tracker: Optional["alerts.AlertSessionTracker"] = None,
+) -> dict[str, Any]:
+    """
+    Convenience entry point for main.py: invoked when the user types
+    "stop", immediately generating and appending the final session
+    report using the current time as the session end.
+
+    Args:
+        session_start: Timestamp marking when monitoring began (main.py
+            should track and pass this in).
+        alert_tracker: Optional AlertSessionTracker override.
+
+    Returns:
+        The generated summary dict (see generate_session_report()).
+    """
+    return generate_session_report(
+        session_start=session_start,
+        session_end=datetime.utcnow(),
+        alert_tracker=alert_tracker,
+    )
+
+
+__all__ = [
+    "generate_session_report",
+    "generate_report_on_stop",
+]
