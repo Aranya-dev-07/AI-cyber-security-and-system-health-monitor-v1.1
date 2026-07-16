@@ -37,8 +37,15 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    JSON,
 )
 from sqlalchemy.orm import relationship
+
+try:
+    from sqlalchemy.dialects.postgresql import JSONB
+    _JSON_TYPE = JSONB
+except ImportError:  # pragma: no cover - non-PostgreSQL fallback (e.g. SQLite)
+    _JSON_TYPE = JSON
 
 try:
     from .database import Base
@@ -69,6 +76,12 @@ class TestRun(Base):
     )
     processes = relationship(
         "SystemProcess",
+        back_populates="test_run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    ai_results = relationship(
+        "AIResult",
         back_populates="test_run",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -162,8 +175,60 @@ class SystemProcess(Base):
         )
 
 
+# =====================================================================
+# AI RESULTS
+# =====================================================================
+
+class AIResult(Base):
+    """
+    One unified AI orchestration cycle result, mirroring
+    ai.ai_engine.AIEngineResult. Stored as structured JSON/JSONB
+    columns so the full explainable output (health score, anomalies,
+    root causes, trends, predictions, recommendations) is preserved
+    without needing a separate table per AI subsystem.
+    """
+
+    __tablename__ = "ai_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True, index=True)
+    test_run_id = Column(
+        Integer,
+        ForeignKey("test_run.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+
+    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+    health_score = Column(Float, nullable=True)
+    health_status = Column(String(50), nullable=True)
+
+    health_details = Column(_JSON_TYPE, nullable=True)
+    anomalies = Column(_JSON_TYPE, nullable=True)
+    root_causes = Column(_JSON_TYPE, nullable=True)
+    trends = Column(_JSON_TYPE, nullable=True)
+    resource_growth = Column(_JSON_TYPE, nullable=True)
+    process_memory_leaks = Column(_JSON_TYPE, nullable=True)
+    predictions = Column(_JSON_TYPE, nullable=True)
+    recommendations = Column(_JSON_TYPE, nullable=True)
+    errors = Column(_JSON_TYPE, nullable=True)
+
+    test_run = relationship("TestRun", back_populates="ai_results")
+
+    __table_args__ = (
+        Index("ix_ai_results_test_run_timestamp", "test_run_id", "timestamp"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug convenience
+        return (
+            f"<AIResult id={self.id} timestamp={self.timestamp} "
+            f"health_status={self.health_status}>"
+        )
+
+
 __all__ = [
     "TestRun",
     "SystemMetric",
     "SystemProcess",
+    "AIResult",
 ]

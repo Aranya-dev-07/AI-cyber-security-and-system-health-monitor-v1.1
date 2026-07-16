@@ -35,10 +35,10 @@ from sqlalchemy.orm import Session
 
 try:
     from .database import SessionLocal, session_scope
-    from .models import TestRun, SystemMetric, SystemProcess
+    from .models import TestRun, SystemMetric, SystemProcess, AIResult
 except ImportError:  # pragma: no cover - fallback for non-package execution
     from database import SessionLocal, session_scope  # type: ignore
-    from models import TestRun, SystemMetric, SystemProcess  # type: ignore
+    from models import TestRun, SystemMetric, SystemProcess, AIResult  # type: ignore
 
 logger = logging.getLogger("lavender_trinetra.database.crud")
 logger.addHandler(logging.NullHandler())
@@ -347,6 +347,96 @@ def read_processes(
 
 
 # =====================================================================
+# AI RESULT OPERATIONS
+# =====================================================================
+
+def insert_ai_result(
+    result: dict[str, Any],
+    test_run_id: Optional[int] = None,
+    db: Optional[Session] = None,
+) -> dict[str, Any]:
+    """
+    Persist a single unified AI orchestration cycle result (the dict
+    returned by ai.ai_engine.run_ai_cycle() / AIEngineResult.to_dict()).
+    Intended to be called automatically from main.py after each AI
+    cycle while a monitoring session is active.
+
+    Args:
+        result: Dict matching ai_engine.AIEngineResult's shape:
+            timestamp, health_score (nested dict), anomalies, root_causes,
+            trends, resource_growth, process_memory_leaks, predictions,
+            recommendations, errors.
+        test_run_id: Associated TestRun ID, if a session is active.
+        db: Optional injected Session.
+
+    Returns:
+        Dict representation of the inserted AIResult row.
+    """
+    try:
+        with _resolve_session(db) as (session, owns_session):
+            health = result.get("health_score") or {}
+            record = AIResult(
+                test_run_id=test_run_id,
+                timestamp=_parse_timestamp(result.get("timestamp")),
+                health_score=health.get("score"),
+                health_status=health.get("status"),
+                health_details=health,
+                anomalies=result.get("anomalies", []),
+                root_causes=result.get("root_causes", []),
+                trends=result.get("trends", []),
+                resource_growth=result.get("resource_growth", []),
+                process_memory_leaks=result.get("process_memory_leaks", []),
+                predictions=result.get("predictions", []),
+                recommendations=result.get("recommendations", []),
+                errors=result.get("errors", []),
+            )
+            session.add(record)
+            session.flush()
+            saved = _ai_result_to_dict(record)
+
+        return saved
+
+    except SQLAlchemyError as exc:
+        logger.exception("Failed to insert AI result: %s", exc)
+        raise
+
+
+def read_ai_results(
+    test_run_id: Optional[int] = None,
+    since: Optional[datetime] = None,
+    limit: int = 200,
+    db: Optional[Session] = None,
+) -> list[dict[str, Any]]:
+    """
+    Read stored AI orchestration results, optionally scoped to a test
+    run and/or a start timestamp, most recent first.
+
+    Args:
+        test_run_id: If provided, restrict to this TestRun.
+        since: If provided, only rows with timestamp >= this value.
+        limit: Maximum number of rows to return.
+        db: Optional injected Session.
+
+    Returns:
+        List of AIResult dicts, ordered by timestamp descending.
+    """
+    try:
+        with _resolve_session(db) as (session, _owns_session):
+            query = session.query(AIResult)
+            if test_run_id is not None:
+                query = query.filter(AIResult.test_run_id == test_run_id)
+            if since is not None:
+                query = query.filter(AIResult.timestamp >= since)
+
+            rows = query.order_by(AIResult.timestamp.desc()).limit(limit).all()
+            return [_ai_result_to_dict(r) for r in rows]
+
+    except SQLAlchemyError as exc:
+        logger.exception("Failed to read AI results: %s", exc)
+        raise
+
+
+# =====================================================================
 # REPORTS (TEST RUN HISTORY)
 # =====================================================================
 
@@ -418,10 +508,16 @@ def get_dashboard_statistics(db: Optional[Session] = None) -> dict[str, Any]:
 
             total_metric_samples = session.query(func.count(SystemMetric.id)).scalar() or 0
             total_process_samples = session.query(func.count(SystemProcess.id)).scalar() or 0
+            total_ai_results = session.query(func.count(AIResult.id)).scalar() or 0
 
             latest_run = (
                 session.query(TestRun)
                 .order_by(TestRun.start_time.desc())
+                .first()
+            )
+            latest_ai_result = (
+                session.query(AIResult)
+                .order_by(AIResult.timestamp.desc())
                 .first()
             )
 
@@ -435,7 +531,10 @@ def get_dashboard_statistics(db: Optional[Session] = None) -> dict[str, Any]:
                 "avg_disk_usage": round(float(disk_avg), 2),
                 "total_metric_samples": total_metric_samples,
                 "total_process_samples": total_process_samples,
+                "total_ai_results": total_ai_results,
                 "latest_run": _test_run_to_dict(latest_run) if latest_run else None,
+                "latest_health_status": latest_ai_result.health_status if latest_ai_result else None,
+                "latest_health_score": latest_ai_result.health_score if latest_ai_result else None,
             }
 
     except SQLAlchemyError as exc:
@@ -499,6 +598,26 @@ def _system_process_to_dict(record: SystemProcess) -> dict[str, Any]:
     }
 
 
+def _ai_result_to_dict(record: AIResult) -> dict[str, Any]:
+    """Convert an AIResult ORM instance into a plain, session-independent dict."""
+    return {
+        "id": record.id,
+        "test_run_id": record.test_run_id,
+        "timestamp": record.timestamp.isoformat() if record.timestamp else None,
+        "health_score": record.health_score,
+        "health_status": record.health_status,
+        "health_details": record.health_details,
+        "anomalies": record.anomalies,
+        "root_causes": record.root_causes,
+        "trends": record.trends,
+        "resource_growth": record.resource_growth,
+        "process_memory_leaks": record.process_memory_leaks,
+        "predictions": record.predictions,
+        "recommendations": record.recommendations,
+        "errors": record.errors,
+    }
+
+
 __all__ = [
     "create_test_run",
     "end_test_run",
@@ -507,6 +626,8 @@ __all__ = [
     "read_metrics",
     "insert_process_metrics",
     "read_processes",
+    "insert_ai_result",
+    "read_ai_results",
     "read_reports",
     "get_dashboard_statistics",
 ]
