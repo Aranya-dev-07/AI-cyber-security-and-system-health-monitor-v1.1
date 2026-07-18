@@ -41,11 +41,15 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 
-try:
-    from sqlalchemy.dialects.postgresql import JSONB
-    _JSON_TYPE = JSONB
-except ImportError:  # pragma: no cover - non-PostgreSQL fallback (e.g. SQLite)
-    _JSON_TYPE = JSON
+# NOTE: `sqlalchemy.dialects.postgresql` ships inside SQLAlchemy itself and
+# always imports successfully, even without a PostgreSQL driver installed -
+# so a bare `try/except ImportError` around this import never actually
+# falls back. Use a dialect-aware variant type instead: it renders as
+# JSONB on PostgreSQL and as plain JSON on every other backend (SQLite,
+# MySQL, etc.) at DDL-compile time, based on the engine actually in use.
+from sqlalchemy.dialects.postgresql import JSONB
+
+_JSON_TYPE = JSON().with_variant(JSONB, "postgresql")
 
 try:
     from .database import Base

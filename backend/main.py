@@ -5,7 +5,7 @@ import signal
 import sys
 import threading
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import uvicorn
 
@@ -29,6 +29,7 @@ from backend.monitoring import alerts as monitoring_alerts
 from backend.monitoring import reports as monitoring_reports
 
 from backend.ai import ai_engine as ai_engine_module
+from backend.ai.predictive_alerts import load_monitoring_history
 
 from backend.database import database as db_module
 from backend.database import crud as db_crud
@@ -43,11 +44,14 @@ Type "start" to begin monitoring.
 Type "stop" to stop monitoring."""
 
 METRICS_HEADERS = [
-    "timestamp", "cpu_percent", "memory_percent",
-    "disk_percent", "network_sent_mb", "network_received_mb",
+    "timestamp", "cpu_usage", "ram_usage", "disk_usage",
+    "disk_read_bps", "disk_write_bps", "network_in_bps", "network_out_bps",
 ]
 PROCESSES_HEADERS = ["timestamp", "pid", "name", "cpu_percent", "memory_percent"]
 REPORT_HEADERS = ["timestamp", "run_id", "summary"]
+
+MAX_HISTORY_ROWS = 500
+MAX_PROCESS_HISTORY_ROWS = 500
 
 COLLECTION_INTERVAL_SECONDS = settings.COLLECTION_INTERVAL_SECONDS
 API_HOST = settings.API_HOST
@@ -89,9 +93,14 @@ class Orchestrator:
         self._api_server: Optional[uvicorn.Server] = None
 
         self._run_id: Optional[int] = None
+        self._session_start: Optional[datetime] = None
         self._alert_tracker = monitoring_alerts.get_session_tracker()
         self._ai_engine: Optional[ai_engine_module.AIEngine] = None
         self._cyber_module = None
+
+        self._history_rows: list[dict[str, Any]] = []
+        self._process_history_rows: list[dict[str, Any]] = []
+        self._last_ai_result: Optional[dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     # API server lifecycle
@@ -145,7 +154,7 @@ class Orchestrator:
             if self._run_id is not None:
                 context = test_run_manager.end_run()
                 alert_count = context.alert_count if context else 0
-                db_crud.end_test_run(self._run_id, alert_count=alert_count)
+                db_crud.end_test_run(self._run_id, total_alerts=alert_count)
             logger.info("Database writes finalized.")
 
     # ------------------------------------------------------------------
@@ -191,18 +200,21 @@ class Orchestrator:
     # Monitoring loop
     # ------------------------------------------------------------------
     def _monitoring_cycle(self) -> None:
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.utcnow()
+        timestamp_iso = timestamp.isoformat()
 
         system_metrics = monitoring_collector.collect_system_metrics()
         top_processes = monitoring_processes.collect_top_processes()
 
         metrics_row = {
-            "timestamp": timestamp,
-            "cpu_percent": getattr(system_metrics, "cpu_percent", None),
-            "memory_percent": getattr(system_metrics, "memory_percent", None),
-            "disk_percent": getattr(system_metrics, "disk_percent", None),
-            "network_sent_mb": getattr(system_metrics, "network_sent_mb", None),
-            "network_received_mb": getattr(system_metrics, "network_received_mb", None),
+            "timestamp": timestamp_iso,
+            "cpu_usage": system_metrics.cpu_usage,
+            "ram_usage": system_metrics.ram_usage,
+            "disk_usage": system_metrics.disk_usage,
+            "disk_read_bps": system_metrics.disk_read_bps,
+            "disk_write_bps": system_metrics.disk_write_bps,
+            "network_in_bps": system_metrics.network_in_bps,
+            "network_out_bps": system_metrics.network_out_bps,
         }
         # Delegates CSV persistence to monitoring/metrics.py, which uses
         # core.py's CSV helpers internally - no duplicated CSV logic here.
@@ -210,28 +222,65 @@ class Orchestrator:
 
         process_rows = [
             {
-                "timestamp": timestamp,
-                "pid": p.pid if hasattr(p, "pid") else p.get("pid"),
-                "name": p.name if hasattr(p, "name") else p.get("name"),
-                "cpu_percent": p.cpu_percent if hasattr(p, "cpu_percent") else p.get("cpu_percent"),
-                "memory_percent": p.memory_percent if hasattr(p, "memory_percent") else p.get("memory_percent"),
+                "timestamp": timestamp_iso,
+                "pid": p.pid,
+                "name": p.name,
+                "cpu_percent": p.cpu_percent,
+                "memory_percent": p.memory_percent,
             }
             for p in top_processes
         ]
-        monitoring_metrics.save_process_metrics(process_rows, timestamp=timestamp)
+        monitoring_metrics.save_process_metrics(process_rows, timestamp=timestamp_iso)
 
-        alerts = monitoring_alerts.generate_alerts(metrics_row, tracker=self._alert_tracker)
+        alerts = monitoring_alerts.generate_alerts(
+            cpu_usage=metrics_row["cpu_usage"],
+            ram_usage=metrics_row["ram_usage"],
+            disk_usage=metrics_row["disk_usage"],
+            network_in_bps=metrics_row["network_in_bps"],
+            network_out_bps=metrics_row["network_out_bps"],
+            timestamp=timestamp_iso,
+            tracker=self._alert_tracker,
+        )
         if alerts:
-            test_run_manager.record_alert(len(alerts) if hasattr(alerts, "__len__") else 1)
+            test_run_manager.record_alert(len(alerts))
 
         with safe_execute("database-write-cycle"):
             with db_module.session_scope() as session:
-                db_crud.insert_system_metrics(metrics_row, run_id=self._run_id, db=session)
-                db_crud.insert_process_metrics(process_rows, run_id=self._run_id, db=session)
+                db_crud.insert_system_metrics(metrics_row, test_run_id=self._run_id, db=session)
+                db_crud.insert_process_metrics(process_rows, test_run_id=self._run_id, db=session)
+
+        # Maintain bounded in-memory history for the AI engine.
+        self._history_rows.append(metrics_row)
+        if len(self._history_rows) > MAX_HISTORY_ROWS:
+            self._history_rows = self._history_rows[-MAX_HISTORY_ROWS:]
+
+        self._process_history_rows.extend(process_rows)
+        if len(self._process_history_rows) > MAX_PROCESS_HISTORY_ROWS:
+            self._process_history_rows = self._process_history_rows[-MAX_PROCESS_HISTORY_ROWS:]
 
         if self._ai_engine is not None:
             with safe_execute("ai-engine-cycle"):
-                ai_engine_module.run_ai_cycle(self._ai_engine, metrics_row, process_rows)
+                # load_monitoring_history() parses the "timestamp" column
+                # and sets it as a DatetimeIndex - this is the format
+                # predictive_alerts.prepare_prediction_features() expects.
+                # A plain pd.DataFrame(rows) would keep a default integer
+                # RangeIndex and break sort_index() when concatenated
+                # against a Timestamp-indexed snapshot series.
+                history_df = load_monitoring_history(self._history_rows)
+                result = ai_engine_module.run_ai_cycle(
+                    timestamp=timestamp,
+                    cpu_usage=metrics_row["cpu_usage"],
+                    ram_usage=metrics_row["ram_usage"],
+                    disk_usage=metrics_row["disk_usage"],
+                    history=history_df,
+                    disk_read_bps=metrics_row["disk_read_bps"],
+                    disk_write_bps=metrics_row["disk_write_bps"],
+                    network_in_bps=metrics_row["network_in_bps"],
+                    network_out_bps=metrics_row["network_out_bps"],
+                    processes=process_rows,
+                    process_history=self._process_history_rows,
+                )
+                self._last_ai_result = result
 
         if self._cyber_module is not None and hasattr(self._cyber_module, "run_cycle"):
             with safe_execute("cybersecurity-cycle"):
@@ -252,6 +301,11 @@ class Orchestrator:
     # ------------------------------------------------------------------
     def start(self) -> None:
         logger.info("Starting Lavender Trinetra services...")
+
+        self._session_start = datetime.utcnow()
+        self._history_rows = []
+        self._process_history_rows = []
+        self._last_ai_result = None
 
         startup_initialize(METRICS_HEADERS, PROCESSES_HEADERS, REPORT_HEADERS)
         self.init_database()
@@ -279,17 +333,16 @@ class Orchestrator:
         self._stop_monitoring_thread()
 
         with safe_execute("csv-report-finalize"):
-            report = monitoring_reports.generate_report_on_stop(run_id=self._run_id)
+            report = monitoring_reports.generate_report_on_stop(
+                session_start=self._session_start or datetime.utcnow(),
+                alert_tracker=self._alert_tracker,
+            )
             monitoring_metrics.save_system_report(report)
 
-        if self._ai_engine is not None:
+        if self._last_ai_result is not None and self._run_id is not None:
             with safe_execute("ai-report-finalize"):
-                result = ai_engine_module.get_latest_result_dict(
-                    getattr(self._ai_engine, "last_result", None)
-                )
-                if self._run_id is not None:
-                    with db_module.session_scope() as session:
-                        db_crud.insert_ai_result(result, run_id=self._run_id, db=session)
+                with db_module.session_scope() as session:
+                    db_crud.insert_ai_result(self._last_ai_result, test_run_id=self._run_id, db=session)
 
         # safe_shutdown() runs all registered cleanup callbacks (API,
         # cybersecurity, database) in reverse order and marks every
