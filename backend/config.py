@@ -88,17 +88,25 @@ class CSVConfig:
 
 @dataclass(frozen=True)
 class DatabaseConfig:
+    DB_ENGINE: str = _env_str("DB_ENGINE", "sqlite")
     DB_HOST: str = _env_str("DB_HOST", "localhost")
     DB_PORT: int = _env_int("DB_PORT", 5432)
     DB_NAME: str = _env_str("DB_NAME", "lavender_trinetra")
     DB_USER: str = _env_str("DB_USER", "postgres")
     DB_PASSWORD: str = _env_str("DB_PASSWORD", "")
     DB_SSLMODE: str = _env_str("DB_SSLMODE", "prefer")
+    SQLITE_PATH: str = _env_str(
+        "SQLITE_PATH", str(BASE_DIR / "backend" / "data" / "lavender_trinetra.db")
+    )
     DATABASE_URL: str = _env_str(
         "DATABASE_URL",
-        f"postgresql+psycopg2://{_env_str('DB_USER', 'postgres')}:"
-        f"{_env_str('DB_PASSWORD', '')}@{_env_str('DB_HOST', 'localhost')}:"
-        f"{_env_int('DB_PORT', 5432)}/{_env_str('DB_NAME', 'lavender_trinetra')}",
+        f"sqlite:///{_env_str('SQLITE_PATH', str(BASE_DIR / 'backend' / 'data' / 'lavender_trinetra.db'))}"
+        if _env_str("DB_ENGINE", "sqlite") == "sqlite"
+        else (
+            f"postgresql+psycopg2://{_env_str('DB_USER', 'postgres')}:"
+            f"{_env_str('DB_PASSWORD', '')}@{_env_str('DB_HOST', 'localhost')}:"
+            f"{_env_int('DB_PORT', 5432)}/{_env_str('DB_NAME', 'lavender_trinetra')}"
+        ),
     )
     DB_POOL_SIZE: int = _env_int("DB_POOL_SIZE", 10)
     DB_MAX_OVERFLOW: int = _env_int("DB_MAX_OVERFLOW", 20)

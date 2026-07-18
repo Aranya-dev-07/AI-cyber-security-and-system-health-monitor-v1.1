@@ -15,7 +15,13 @@ from backend.ai import (
     predictive_alerts as ai_predictive_alerts,
     anomaly_detection as ai_anomaly_detection,
 )
-from backend.cybersecurity import security_score as cyber_security_score
+try:
+    from backend.cybersecurity import security_score as cyber_security_score
+except ImportError:
+    cyber_security_score = None
+    logging.getLogger("lavender_trinetra.routes").warning(
+        "backend.cybersecurity module not found - /cybersecurity/score will return 503 until it is implemented."
+    )
 
 logger = logging.getLogger("lavender_trinetra.routes")
 
@@ -168,6 +174,8 @@ async def get_report_detail(report_id: int, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------------------
 @router.get("/cybersecurity/score", response_model=schemas.SecurityScoreResponse)
 async def get_security_score():
+    if cyber_security_score is None:
+        raise HTTPException(status_code=503, detail="Cybersecurity module not yet implemented")
     try:
         return cyber_security_score.compute_security_score()
     except Exception as exc:
