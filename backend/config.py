@@ -3,12 +3,16 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
-import dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - fallback when python-dotenv is absent
+    def load_dotenv(*args: Any, **kwargs: Any) -> bool:
+        return False
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-dotenv.load_dotenv(BASE_DIR / ".env")
+load_dotenv(BASE_DIR / ".env")
 
 
 def _env_str(name: str, default: str) -> str:
