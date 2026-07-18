@@ -1,500 +1,358 @@
-"""
-main.py
-=======
-Central orchestrator for the System Health Monitor and Cybersecurity
-Monitoring Platform.
-
-Responsibilities:
-    * Display the welcome screen and command prompt.
-    * Parse user commands (``start``, ``stop``, ``exit`` / ``quit``).
-    * Manage the background monitoring thread (start/stop, clean shutdown).
-    * Manage the background FastAPI server thread (launched once, for the
-      lifetime of the program).
-    * Own the database lifecycle for each run: create the ``test_run`` row
-      at start, insert metrics/processes every cycle, and close out the
-      run (plus reconcile CSV -> DB) at stop.
-
-ARCHITECTURE NOTE
-------------------
-``main.py`` sits at the top of the import graph and imports all three
-other project modules:
-
-    config.py  <-- database.py  <-- api.py  <-- main.py
-
-DATABASE WRITE STRATEGY NOTE
--------------------------------
-``insert_system_metrics()`` and ``insert_system_processes()`` are called
-**live, once per collection cycle**, inside the monitoring loop below -
-not bulk-replayed at the end of the run. This keeps data durable even if
-the program is killed mid-run. ``insert_test_run()`` is called exactly
-once, when ``start_monitoring()`` runs, to obtain the ``run_id`` used by
-every subsequent insert. When ``stop_monitoring()`` runs,
-``update_test_run_end()`` closes out that row with its final end time and
-alert count.
-
-``database.sync_csv_to_database()`` is deliberately **not** called from
-``stop_monitoring()``: since every row is already inserted live during
-the run, re-reading the CSV files and inserting them again at stop would
-duplicate every row in ``system_metrics`` and ``system_processes``.
-``sync_csv_to_database()`` remains available in ``database.py`` for
-manual/recovery use (e.g. reconciling the database from CSV after a crash
-where live inserts were missed), but is not part of the normal run
-lifecycle.
-
-API SERVER NOTE
-------------------
-The FastAPI app (``api.app``) is launched once, in its own background
-thread, when the program starts - independent of whether monitoring is
-currently running. This lets ``/metrics``, ``/processes``, ``/runs``, and
-``/summary`` be queried over HTTP at any time while the interactive
-``start`` / ``stop`` CLI is used in the foreground.
-"""
-
 from __future__ import annotations
 
-import logging
+import asyncio
+import signal
+import sys
 import threading
-import time
 from datetime import datetime
 from typing import Optional
 
-import config
-import database
-import api
-import ai_engine
-import dashboard  # mounts /dashboard/ static route onto api.app as a side effect
+import uvicorn
 
-logger = logging.getLogger(__name__)
+from backend.config import settings
+from backend.core import (
+    get_logger,
+    test_run_manager,
+    application_status,
+    StatusValue,
+    startup_initialize,
+    register_cleanup,
+    safe_shutdown,
+    safe_execute,
+)
+from backend.api.api import app as fastapi_app
 
-# ---------------------------------------------------------------------------
-# Module-level orchestration state
-# ---------------------------------------------------------------------------
-_monitoring_thread: Optional[threading.Thread] = None
-_api_thread: Optional[threading.Thread] = None
-_current_run_id: int = -1
+from backend.monitoring import collector as monitoring_collector
+from backend.monitoring import processes as monitoring_processes
+from backend.monitoring import metrics as monitoring_metrics
+from backend.monitoring import alerts as monitoring_alerts
+from backend.monitoring import reports as monitoring_reports
 
-API_HOST: str = "127.0.0.1"
-API_PORT: int = 8000
+from backend.ai import ai_engine as ai_engine_module
 
-WELCOME_BANNER: str = r"""
-╔══════════════════════════════════════════════════════════════════════╗
-║                                                                      ║
-║   ███████╗██╗  ██╗███╗   ███╗                                        ║
-║   ██╔════╝██║  ██║████╗ ████║                                        ║
-║   ███████╗███████║██╔████╔██║                                        ║
-║   ╚════██║██╔══██║██║╚██╔╝██║                                        ║
-║   ███████║██║  ██║██║ ╚═╝ ██║                                        ║
-║   ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝                                        ║
-║                                                                      ║
-║   ██╗  ██╗███████╗ █████╗ ██╗  ████████╗██╗  ██╗                     ║
-║   ██║  ██║██╔════╝██╔══██╗██║  ╚══██╔══╝██║  ██║                     ║
-║   ███████║█████╗  ███████║██║     ██║   ███████║                     ║
-║   ██╔══██║██╔══╝  ██╔══██║██║     ██║   ██╔══██║                     ║
-║   ██║  ██║███████╗██║  ██║███████╗██║   ██║  ██║                     ║
-║   ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝╚═╝   ╚═╝  ╚═╝                     ║
-║                                                                      ║
-║   ███╗   ███╗ ██████╗ ███╗   ██╗██╗████████╗ ██████╗ ██████╗         ║
-║   ████╗ ████║██╔═══██╗████╗  ██║██║╚══██╔══╝██╔═══██╗██╔══██╗        ║
-║   ██╔████╔██║██║   ██║██╔██╗ ██║██║   ██║   ██║   ██║██████╔╝        ║
-║   ██║╚██╔╝██║██║   ██║██║╚██╗██║██║   ██║   ██║   ██║██╔══██╗        ║
-║   ██║ ╚═╝ ██║╚██████╔╝██║ ╚████║██║   ██║   ╚██████╔╝██║  ██║        ║
-║   ╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝        ║
-║                                                                      ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║   Cybersecurity & System Health Monitoring Platform  v1.0.0          ║
-║   Powered by Python 3.12 • FastAPI • SQLite • psutil                 ║
-║                                                                      ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║   Welcome, User! System is ready.                                    ║
-║                                                                      ║
-║   COMMANDS                                                           ║
-║   ──────────────────────────────────────                             ║
-║     start  →  Begin monitoring CPU, RAM, Disk & Network              ║
-║     stop   →  Stop monitoring & save run summary                     ║
-║     exit   →  Quit the program (auto-stops if running)               ║
-║     quit   →  Quit the program (auto-stops if running)               ║
-║                                                                      ║
-║   API available at: http://127.0.0.1:8000/docs                       ║
-║                                                                      ║
-╚══════════════════════════════════════════════════════════════════════╝
-"""
+from backend.database import database as db_module
+from backend.database import crud as db_crud
+
+logger = get_logger("lavender_trinetra.main")
+
+BANNER = """=========================================
+\u222b Lavender Trinetra
+Observe. Learn. Protect.
+=========================================
+Type "start" to begin monitoring.
+Type "stop" to stop monitoring."""
+
+METRICS_HEADERS = [
+    "timestamp", "cpu_percent", "memory_percent",
+    "disk_percent", "network_sent_mb", "network_received_mb",
+]
+PROCESSES_HEADERS = ["timestamp", "pid", "name", "cpu_percent", "memory_percent"]
+REPORT_HEADERS = ["timestamp", "run_id", "summary"]
+
+COLLECTION_INTERVAL_SECONDS = settings.COLLECTION_INTERVAL_SECONDS
+API_HOST = settings.API_HOST
+API_PORT = settings.API_PORT
 
 
-# ---------------------------------------------------------------------------
-# CSV run header stamper
-# ---------------------------------------------------------------------------
-def _stamp_csv_run_header(run_number: int) -> None:
-    """Write a 'Run N' separator header into every CSV file and print it.
+class CybersecurityEngineUnavailable(Exception):
+    pass
 
-    Called once at the start of each monitoring run, before any data rows
-    are written, so it's always clear in the CSV files and terminal output
-    which rows belong to which run.
 
-    The header line is written as a comment row (prefixed with ``#``) so
-    standard CSV parsers that ignore comment lines won't choke on it, while
-    it remains clearly visible when the file is opened in a text editor or
-    spreadsheet.
-
-    Args:
-        run_number: The 1-based run number to display (matches the
-            ``test_run.id`` value assigned by the database).
+def _load_cybersecurity_engine():
     """
-    header_line = f"# {'=' * 60}"
-    run_label   = f"# Data for Run {run_number}  —  started {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    footer_line = f"# {'=' * 60}"
-
-    terminal_msg = (
-        f"\n{'=' * 64}\n"
-        f"  📋  Now recording data for Run {run_number}\n"
-        f"  ⏱   Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"  📁  Writing to: {config.CSV_METRICS_PATH}, "
-        f"{config.CSV_PROCESSES_PATH}, {config.CSV_REPORT_PATH}\n"
-        f"{'=' * 64}\n"
-    )
-
-    csv_files = [
-        config.CSV_METRICS_PATH,
-        config.CSV_PROCESSES_PATH,
-        config.CSV_REPORT_PATH,
-    ]
-
-    for csv_path in csv_files:
-        try:
-            with open(csv_path, mode="a", encoding="utf-8") as f:
-                f.write(f"{header_line}\n")
-                f.write(f"{run_label}\n")
-                f.write(f"{footer_line}\n")
-        except OSError:
-            logger.exception("Failed to write run header to '%s'.", csv_path)
-
-    print(terminal_msg)
-    logger.info("Stamped Run %d header into CSV files.", run_number)
-
-
-# ---------------------------------------------------------------------------
-# API server thread
-# ---------------------------------------------------------------------------
-def _run_api_server() -> None:
-    """Run the FastAPI app (``api.app``) via uvicorn on a background thread.
-
-    Intended to be the target of a daemon ``threading.Thread`` started
-    once at program launch. Any failure to import or run uvicorn is
-    logged clearly rather than crashing the whole program, since the CLI
-    should remain usable even if the API server cannot start (e.g.
-    uvicorn not installed in the current environment).
+    Loads the cybersecurity coordination entrypoint. Imported lazily and
+    isolated behind a try/except so the orchestrator can still run
+    monitoring, AI and the API even if the cybersecurity module is not
+    yet present or fails to import.
     """
     try:
-        import uvicorn
-    except ImportError:
-        logger.error(
-            "uvicorn is not installed; the FastAPI server will not start. "
-            "Install it with 'pip install uvicorn' to enable the API."
-        )
-        return
+        from backend.cybersecurity import threat_detector
 
-    try:
-        logger.info("Starting FastAPI server on http://%s:%d", API_HOST, API_PORT)
-        uvicorn_config = uvicorn.Config(
-            app=api.app,
+        return threat_detector
+    except Exception as exc:
+        logger.warning("Cybersecurity module unavailable: %s", exc)
+        raise CybersecurityEngineUnavailable(str(exc))
+
+
+class Orchestrator:
+    """
+    Sole backend orchestrator. Coordinates monitoring, AI, cybersecurity,
+    database and API modules without implementing their internal logic.
+    All shared utilities (logging, status, CSV, cleanup) are delegated to
+    core.py; all configuration is sourced from config.py.
+    """
+
+    def __init__(self) -> None:
+        self._stop_event = threading.Event()
+        self._monitoring_thread: Optional[threading.Thread] = None
+        self._api_thread: Optional[threading.Thread] = None
+        self._api_server: Optional[uvicorn.Server] = None
+
+        self._run_id: Optional[int] = None
+        self._alert_tracker = monitoring_alerts.get_session_tracker()
+        self._ai_engine: Optional[ai_engine_module.AIEngine] = None
+        self._cyber_module = None
+
+    # ------------------------------------------------------------------
+    # API server lifecycle
+    # ------------------------------------------------------------------
+    def start_api_server(self) -> None:
+        config = uvicorn.Config(
+            fastapi_app,
             host=API_HOST,
             port=API_PORT,
-            log_level="warning",
+            log_level=settings.LOG_LEVEL.lower(),
+            loop="asyncio",
         )
-        server = uvicorn.Server(uvicorn_config)
-        server.run()
-    except Exception:
-        logger.exception("FastAPI server thread terminated unexpectedly.")
+        self._api_server = uvicorn.Server(config)
 
+        def _run_server() -> None:
+            with safe_execute("api-server"):
+                self._api_server.run()
 
-def _launch_api_server() -> None:
-    """Start the API server thread exactly once, if not already running.
+        self._api_thread = threading.Thread(target=_run_server, name="api-server", daemon=True)
+        self._api_thread.start()
+        application_status.set_api_status(StatusValue.OPERATIONAL)
+        logger.info("API service started at http://%s:%s", API_HOST, API_PORT)
+        register_cleanup(self.stop_api_server)
 
-    The thread is created as a daemon so it never blocks program exit.
-    """
-    global _api_thread
+    def stop_api_server(self) -> None:
+        if self._api_server is not None:
+            self._api_server.should_exit = True
+        if self._api_thread is not None:
+            self._api_thread.join(timeout=5)
+        application_status.set_api_status(StatusValue.STOPPED)
+        logger.info("API service stopped.")
 
-    if _api_thread is not None and _api_thread.is_alive():
-        logger.warning("API server thread already running; skipping relaunch.")
-        return
-
-    _api_thread = threading.Thread(target=_run_api_server, daemon=True, name="APIServerThread")
-    _api_thread.start()
-    logger.info("API server thread launched.")
-
-
-# ---------------------------------------------------------------------------
-# Monitoring loop
-# ---------------------------------------------------------------------------
-def _monitoring_loop(run_id: int) -> None:
-    """Repeatedly collect metrics and processes until monitoring is stopped.
-
-    Runs on its own background thread. On every cycle: collects system
-    metrics and top-process data via ``config.py``, persists both to
-    SQLite via ``database.py`` tagged with ``run_id``, then sleeps for
-    ``config.MONITOR_INTERVAL`` seconds (minus time already spent
-    collecting, to keep the cadence close to the configured interval).
-
-    Args:
-        run_id: The ``test_run.id`` to associate with every metric and
-            process row inserted during this run.
-    """
-    logger.info("Monitoring loop started for run_id=%d.", run_id)
-
-    while config.monitoring_active.is_set():
-        cycle_start = time.monotonic()
-
-        try:
-            metric = config.collect_system_metrics()
-            if metric:
-                database.insert_system_metrics(metric, run_id)
-
-            processes = config.collect_process_metrics()
-            if processes:
-                database.insert_system_processes(processes, run_id)
-
-            # AI anomaly detection — runs every cycle after data collection
-            if metric:
-                prediction = ai_engine.predict_anomaly(metric, processes)
-                if prediction.is_anomaly:
-                    ai_engine.generate_ai_alert(prediction)
-                    database.insert_ai_prediction(prediction.to_dict(), run_id)
-
-                # Trigger first training once enough samples are collected
-                if (
-                    not ai_engine.engine.is_trained
-                    and len(config.metrics_data) >= ai_engine.engine.cfg.min_train_samples
-                ):
-                    with config.data_lock:
-                        metrics_snap = list(config.metrics_data)
-                        process_snap = list(config.process_data)
-                    ai_engine.train_model(metrics_snap, process_snap)
-
-        except Exception:
-            logger.exception("Unhandled error during a monitoring cycle; continuing loop.")
-
-
-        elapsed = time.monotonic() - cycle_start
-        sleep_time = max(0.0, config.MONITOR_INTERVAL - elapsed)
-
-        # Sleep in small increments so stop_monitoring() (which clears the
-        # Event) is noticed promptly rather than waiting out a full
-        # MONITOR_INTERVAL after the user types 'stop'.
-        slept = 0.0
-        while slept < sleep_time and config.monitoring_active.is_set():
-            time.sleep(min(0.5, sleep_time - slept))
-            slept += 0.5
-
-    logger.info("Monitoring loop exited cleanly for run_id=%d.", run_id)
-
-
-# ---------------------------------------------------------------------------
-# Monitoring control
-# ---------------------------------------------------------------------------
-def start_monitoring() -> None:
-    """Begin a new monitoring run.
-
-    Creates a new ``test_run`` row, records ``config.run_start_time``,
-    resets the shared in-memory buffers and alert counter for the new
-    run, sets the ``monitoring_active`` event, and starts the background
-    monitoring thread.
-
-    If monitoring is already active, logs a warning and does nothing
-    further (idempotent - calling ``start`` twice will not spawn a second
-    thread).
-    """
-    global _monitoring_thread, _current_run_id
-
-    if config.monitoring_active.is_set():
-        print("Monitoring is already running.")
-        logger.warning("start_monitoring() called while monitoring was already active.")
-        return
-
-    try:
-        with config.data_lock:
-            config.metrics_data.clear()
-            config.process_data.clear()
-            config.alert_count = 0
-            config.run_start_time = datetime.now()
-            config.run_end_time = None
-
-        _current_run_id = database.insert_test_run(
-            start_time=config.run_start_time, end_time=None, alert_count=0
-        )
-        if _current_run_id == -1:
-            print("Failed to start monitoring: could not create a database run record.")
-            logger.error("start_monitoring() aborted: insert_test_run() returned -1.")
+    # ------------------------------------------------------------------
+    # Database lifecycle
+    # ------------------------------------------------------------------
+    def init_database(self) -> None:
+        with safe_execute("database-init", reraise=False):
+            db_module.init_db()
+            run = db_crud.create_test_run()
+            self._run_id = run.get("id") if isinstance(run, dict) else None
+            test_run_manager.start_run(run_id=self._run_id)
+            application_status.set_database_status(StatusValue.OPERATIONAL)
+            logger.info("Database initialized. Run ID: %s", self._run_id)
+            register_cleanup(self.finalize_database)
             return
+        application_status.set_database_status(StatusValue.UNAVAILABLE)
+        self._run_id = None
 
-        _stamp_csv_run_header(_current_run_id)
+    def finalize_database(self) -> None:
+        with safe_execute("database-finalize"):
+            if self._run_id is not None:
+                context = test_run_manager.end_run()
+                alert_count = context.alert_count if context else 0
+                db_crud.end_test_run(self._run_id, alert_count=alert_count)
+            logger.info("Database writes finalized.")
 
-        config.monitoring_active.set()
-        _monitoring_thread = threading.Thread(
-            target=_monitoring_loop,
-            args=(_current_run_id,),
-            daemon=True,
-            name="MonitoringThread",
+    # ------------------------------------------------------------------
+    # AI / Cybersecurity initialization
+    # ------------------------------------------------------------------
+    def init_ai_engine(self) -> None:
+        if not settings.AI_ENABLED:
+            application_status.set_ai_status(StatusValue.STOPPED)
+            logger.info("AI engine disabled via configuration.")
+            return
+        with safe_execute("ai-engine-init"):
+            self._ai_engine = ai_engine_module.get_engine()
+            application_status.set_ai_status(StatusValue.OPERATIONAL)
+            logger.info("AI engine started.")
+            return
+        application_status.set_ai_status(StatusValue.UNAVAILABLE)
+        self._ai_engine = None
+
+    def init_cybersecurity_engine(self) -> None:
+        try:
+            self._cyber_module = _load_cybersecurity_engine()
+            if hasattr(self._cyber_module, "start"):
+                self._cyber_module.start()
+            application_status.set_cybersecurity_status(StatusValue.OPERATIONAL)
+            logger.info("Cybersecurity engine started.")
+            register_cleanup(self.shutdown_cybersecurity_engine)
+        except CybersecurityEngineUnavailable:
+            self._cyber_module = None
+            application_status.set_cybersecurity_status(StatusValue.UNAVAILABLE)
+            logger.warning("Cybersecurity engine not started (module unavailable).")
+        except Exception as exc:
+            self._cyber_module = None
+            application_status.set_cybersecurity_status(StatusValue.UNAVAILABLE)
+            logger.error("Failed to start cybersecurity engine: %s", exc)
+
+    def shutdown_cybersecurity_engine(self) -> None:
+        if self._cyber_module is not None and hasattr(self._cyber_module, "stop"):
+            with safe_execute("cybersecurity-shutdown"):
+                self._cyber_module.stop()
+        application_status.set_cybersecurity_status(StatusValue.STOPPED)
+
+    # ------------------------------------------------------------------
+    # Monitoring loop
+    # ------------------------------------------------------------------
+    def _monitoring_cycle(self) -> None:
+        timestamp = datetime.utcnow().isoformat()
+
+        system_metrics = monitoring_collector.collect_system_metrics()
+        top_processes = monitoring_processes.collect_top_processes()
+
+        metrics_row = {
+            "timestamp": timestamp,
+            "cpu_percent": getattr(system_metrics, "cpu_percent", None),
+            "memory_percent": getattr(system_metrics, "memory_percent", None),
+            "disk_percent": getattr(system_metrics, "disk_percent", None),
+            "network_sent_mb": getattr(system_metrics, "network_sent_mb", None),
+            "network_received_mb": getattr(system_metrics, "network_received_mb", None),
+        }
+        # Delegates CSV persistence to monitoring/metrics.py, which uses
+        # core.py's CSV helpers internally - no duplicated CSV logic here.
+        monitoring_metrics.save_system_metrics(metrics_row)
+
+        process_rows = [
+            {
+                "timestamp": timestamp,
+                "pid": p.pid if hasattr(p, "pid") else p.get("pid"),
+                "name": p.name if hasattr(p, "name") else p.get("name"),
+                "cpu_percent": p.cpu_percent if hasattr(p, "cpu_percent") else p.get("cpu_percent"),
+                "memory_percent": p.memory_percent if hasattr(p, "memory_percent") else p.get("memory_percent"),
+            }
+            for p in top_processes
+        ]
+        monitoring_metrics.save_process_metrics(process_rows, timestamp=timestamp)
+
+        alerts = monitoring_alerts.generate_alerts(metrics_row, tracker=self._alert_tracker)
+        if alerts:
+            test_run_manager.record_alert(len(alerts) if hasattr(alerts, "__len__") else 1)
+
+        with safe_execute("database-write-cycle"):
+            with db_module.session_scope() as session:
+                db_crud.insert_system_metrics(metrics_row, run_id=self._run_id, db=session)
+                db_crud.insert_process_metrics(process_rows, run_id=self._run_id, db=session)
+
+        if self._ai_engine is not None:
+            with safe_execute("ai-engine-cycle"):
+                ai_engine_module.run_ai_cycle(self._ai_engine, metrics_row, process_rows)
+
+        if self._cyber_module is not None and hasattr(self._cyber_module, "run_cycle"):
+            with safe_execute("cybersecurity-cycle"):
+                self._cyber_module.run_cycle(metrics_row, process_rows)
+
+    def _monitoring_loop(self) -> None:
+        logger.info("Monitoring loop started.")
+        application_status.set_monitoring_status(StatusValue.OPERATIONAL)
+        while not self._stop_event.is_set():
+            with safe_execute("monitoring-cycle"):
+                self._monitoring_cycle()
+            self._stop_event.wait(COLLECTION_INTERVAL_SECONDS)
+        application_status.set_monitoring_status(StatusValue.STOPPED)
+        logger.info("Monitoring loop terminated.")
+
+    # ------------------------------------------------------------------
+    # Public start / stop
+    # ------------------------------------------------------------------
+    def start(self) -> None:
+        logger.info("Starting Lavender Trinetra services...")
+
+        startup_initialize(METRICS_HEADERS, PROCESSES_HEADERS, REPORT_HEADERS)
+        self.init_database()
+        self.init_ai_engine()
+        self.init_cybersecurity_engine()
+        self.start_api_server()
+
+        self._stop_event.clear()
+        self._monitoring_thread = threading.Thread(
+            target=self._monitoring_loop, name="monitoring-loop", daemon=True
         )
-        _monitoring_thread.start()
+        self._monitoring_thread.start()
+        register_cleanup(self._stop_monitoring_thread)
 
-        print(f"Monitoring started (run_id={_current_run_id}).")
-        logger.info("start_monitoring() succeeded; run_id=%d.", _current_run_id)
+        logger.info("All services started. Monitoring is now active.")
 
-    except Exception:
-        logger.exception("Failed to start monitoring.")
-        print("An error occurred while starting monitoring. Check the logs for details.")
+    def _stop_monitoring_thread(self) -> None:
+        self._stop_event.set()
+        if self._monitoring_thread is not None:
+            self._monitoring_thread.join(timeout=10)
 
+    def stop(self) -> None:
+        logger.info("Stopping Lavender Trinetra services...")
 
-def stop_monitoring() -> None:
-    """Stop the current monitoring run and finalize its records.
+        self._stop_monitoring_thread()
 
-    Clears the ``monitoring_active`` event (signalling the monitoring
-    thread to exit), waits for that thread to finish its current cycle,
-    records ``config.run_end_time``, generates the run summary, writes it
-    to ``system_report.csv``, closes out the ``test_run`` row in the
-    database, and reconciles the CSV files with the database via
-    ``sync_csv_to_database()``.
+        with safe_execute("csv-report-finalize"):
+            report = monitoring_reports.generate_report_on_stop(run_id=self._run_id)
+            monitoring_metrics.save_system_report(report)
 
-    If monitoring is not currently active, logs a warning and does
-    nothing further.
-    """
-    global _monitoring_thread, _current_run_id
+        if self._ai_engine is not None:
+            with safe_execute("ai-report-finalize"):
+                result = ai_engine_module.get_latest_result_dict(
+                    getattr(self._ai_engine, "last_result", None)
+                )
+                if self._run_id is not None:
+                    with db_module.session_scope() as session:
+                        db_crud.insert_ai_result(result, run_id=self._run_id, db=session)
 
-    if not config.monitoring_active.is_set():
-        print("Monitoring is not currently running.")
-        logger.warning("stop_monitoring() called while monitoring was not active.")
-        return
+        # safe_shutdown() runs all registered cleanup callbacks (API,
+        # cybersecurity, database) in reverse order and marks every
+        # component's status as stopped.
+        safe_shutdown()
 
-    try:
-        config.monitoring_active.clear()
-
-        if _monitoring_thread is not None:
-            _monitoring_thread.join(timeout=config.MONITOR_INTERVAL + 5)
-
-        with config.data_lock:
-            config.run_end_time = datetime.now()
-            final_alert_count = config.alert_count
-
-        summary = config.generate_run_summary(run_id=_current_run_id)
-        if summary:
-            config.save_report_to_csv(summary)
-
-        if _current_run_id != -1:
-            database.update_test_run_end(
-                run_id=_current_run_id,
-                end_time=config.run_end_time,
-                alert_count=final_alert_count,
-            )
-            # NOTE: sync_csv_to_database() is intentionally NOT called here.
-            # insert_system_metrics() / insert_system_processes() already
-            # persist every row live, once per collection cycle, inside
-            # _monitoring_loop(). Calling sync_csv_to_database() here as
-            # well would re-insert the same rows a second time (read back
-            # from the CSV files), producing duplicates in system_metrics
-            # and system_processes. sync_csv_to_database() remains
-            # available in database.py for manual/recovery use (e.g.
-            # reconciling the DB after a crash where live inserts were
-            # missed), but the normal stop flow relies solely on the
-            # live inserts already performed during the run.
-
-        print("The system has stopped data collection")
-        print("Exitting Gracefully !!")
-        print("Thank You for using The System Health Monitor \U0001F600")
-        logger.info("stop_monitoring() completed for run_id=%d.", _current_run_id)
-
-    except Exception:
-        logger.exception("Failed to stop monitoring cleanly.")
-        print("An error occurred while stopping monitoring. Check the logs for details.")
+        logger.info("All services stopped cleanly.")
 
 
-# ---------------------------------------------------------------------------
-# Program entry point
-# ---------------------------------------------------------------------------
-def _handle_command(command: str) -> bool:
-    """Process a single user command.
+async def command_loop(orchestrator: Orchestrator) -> None:
+    monitoring_active = False
+    loop = asyncio.get_event_loop()
 
-    Args:
-        command: The raw command string entered by the user.
+    while True:
+        command = (await loop.run_in_executor(None, input, "> ")).strip().lower()
 
-    Returns:
-        ``True`` if the program should continue running, ``False`` if the
-        program should exit.
-    """
-    normalized = command.strip().lower()
+        if command == "start":
+            if monitoring_active:
+                print("Monitoring is already active.")
+                continue
+            orchestrator.start()
+            monitoring_active = True
 
-    if normalized == "start":
-        start_monitoring()
-    elif normalized == "stop":
-        stop_monitoring()
-    elif normalized in ("exit", "quit"):
-        if config.monitoring_active.is_set():
-            stop_monitoring()
-        print("Thank You for using The System Health Monitor \U0001F600")
-        return False
-    elif normalized == "":
-        pass
-    else:
-        print(f"Unrecognized command: '{command}'. Valid commands: start, stop, exit, quit.")
+        elif command == "stop":
+            if not monitoring_active:
+                print("Monitoring is not currently active.")
+                continue
+            orchestrator.stop()
+            monitoring_active = False
+            print("User has stopped data collection.")
+            print("Exiting!!")
+            print("Thank You for using The System Health Monitor \U0001F600")
+            break
 
-    return True
+        else:
+            print('Unrecognized command. Type "start" or "stop".')
+
+
+def _install_signal_handlers(orchestrator: Orchestrator) -> None:
+    def _handle_signal(signum, frame) -> None:  # noqa: ANN001
+        logger.info("Received signal %s, shutting down.", signum)
+        orchestrator.stop()
+        sys.exit(0)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handle_signal)
+        except (ValueError, OSError):
+            pass
 
 
 def main() -> None:
-    """Program entry point: display the welcome screen and run the CLI loop.
-
-    Initializes the database schema, launches the FastAPI server in a
-    background thread, then repeatedly prompts the user for commands
-    until ``exit`` or ``quit`` is entered (or the process receives a
-    keyboard interrupt), at which point any active monitoring run is
-    stopped cleanly before the program exits.
-    """
-    try:
-        database.initialize_database()
-    except Exception:
-        logger.exception("Failed to initialize the database at startup.")
-        print("Warning: database initialization failed. Check the logs for details.")
-
-    # Initialize and load the AI anomaly detection engine
-    try:
-        ai_engine.initialize_model()
-        loaded = ai_engine.load_model()
-        if loaded:
-            print("  ✔  AI model loaded from disk — ready for inference.")
-        else:
-            print(
-                f"  ℹ  AI model will train automatically after "
-                f"{ai_engine.engine.cfg.min_train_samples} monitoring samples are collected."
-            )
-    except Exception:
-        logger.exception("Failed to initialize AI engine at startup.")
-        print("Warning: AI engine initialization failed. Check the logs for details.")
-
-    _launch_api_server()
-
-    print(WELCOME_BANNER)
+    print(BANNER)
+    orchestrator = Orchestrator()
+    _install_signal_handlers(orchestrator)
 
     try:
-        running = True
-        while running:
-            try:
-                command = input("> ")
-            except EOFError:
-                # No more input available (e.g. piped stdin exhausted).
-                break
-            running = _handle_command(command)
-
+        asyncio.run(command_loop(orchestrator))
     except KeyboardInterrupt:
-        print("\nKeyboard interrupt received.")
-        if config.monitoring_active.is_set():
-            stop_monitoring()
+        orchestrator.stop()
+        print("User has stopped data collection.")
+        print("Exiting!!")
         print("Thank You for using The System Health Monitor \U0001F600")
-
-    except Exception:
-        logger.exception("Unhandled exception in main program loop.")
-        if config.monitoring_active.is_set():
-            stop_monitoring()
-        print("An unexpected error occurred. Exiting. Check the logs for details.")
 
 
 if __name__ == "__main__":
